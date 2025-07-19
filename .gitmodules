@@ -1,0 +1,3 @@
+[submodule "internal/go-auth"]
+	path = internal/go-auth
+	url = git@github.com:ja8mpi/go-auth.git

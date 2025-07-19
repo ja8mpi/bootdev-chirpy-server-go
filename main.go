@@ -20,7 +20,13 @@ import (
 )
 
 type parameters struct {
-	Body string `body:"age"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type chripParams struct {
+	Body   string    `json:"body"`
+	UserId uuid.UUID `json:"user_id"`
 }
 
 type errorReturnVals struct {
@@ -36,6 +42,14 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+}
+
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 type cleanedReturnVals struct {
@@ -69,6 +83,13 @@ func (cfg *apiConfig) getMetricsHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func (cfg *apiConfig) resetMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		w.WriteHeader(http.StatusForbidden)
+	}
+	err := cfg.dbQueries.DeleteAllUsers(r.Context())
+	if err != nil {
+		log.Fatalf("failed to delete all users: %v", err)
+	}
 	cfg.fileserverHits.Store(0)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
@@ -81,14 +102,22 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
-func chirpHandler(w http.ResponseWriter, r *http.Request) {
+func (cfg *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
-	params := parameters{}
+	params := chripParams{}
 	err := decoder.Decode(&params)
 
 	if err != nil {
 		log.Printf("Error decoding parameters: %s", err)
 		w.WriteHeader(500)
+		return
+	}
+
+	// Check if user exists
+	_, err = cfg.dbQueries.GetUserByID(r.Context(), params.UserId)
+	if err != nil {
+		// handle user not found error or DB error
+		http.Error(w, "User not found", http.StatusBadRequest)
 		return
 	}
 
@@ -115,16 +144,35 @@ func chirpHandler(w http.ResponseWriter, r *http.Request) {
 	cleanedBody := cleanedReturnVals{
 		CleanedBody: processedWords,
 	}
-	dat, err := json.Marshal(cleanedBody)
+	// dat, err := json.Marshal(cleanedBody)
+	// if err != nil {
+	// 	log.Printf("Error marshalling JSON: %s", err)
+	// 	w.WriteHeader(500)
+	// 	return
+	// }
+	dbChirp, err := cfg.dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   cleanedBody.CleanedBody,
+		UserID: params.UserId,
+	})
+
 	if err != nil {
-		log.Printf("Error marshalling JSON: %s", err)
-		w.WriteHeader(500)
-		return
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return // stop further execution
+	}
+
+	chirp := Chirp{
+		ID:        dbChirp.ID,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	w.Write(dat)
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(chirp)
 }
 
 func hasPunctuation(s string) bool {
@@ -161,15 +209,9 @@ func processWords(input string) (string, error) {
 	return input, nil
 }
 
-func createUser(db *sql.DB) (db *sql.DB, username, password string) error {
-    query := `INSERT INTO users (username, password) VALUES ($1, $2)`
-    _, err := db.Exec(query, username, password)
-    return err
-}
-
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
-	params := parameters{}
+	var params parameters
 	err := decoder.Decode(&params)
 
 	if err != nil {
@@ -178,12 +220,71 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	user, err := cfg.db.CreateUser(r.Context(), params.Email)
+	user, err := cfg.dbQueries.CreateUser(r.Context(), params.Email)
 
-	fmt.Println(params.Body)
-	dat, _ := json.Marshal(params.email)
+	if err != nil {
+		log.Printf("%v", err)
+		w.WriteHeader(500)
+	}
+
+	dat := User{
+		ID:        user.ID,
+		Email:     user.Email,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+	}
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(dat)
+}
+
+func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+	dbChirps, err := cfg.dbQueries.GetChirps(r.Context())
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+
+	var chirps []Chirp
+
+	for _, ch := range dbChirps {
+		chirps = append(chirps, Chirp{
+			ID:        ch.ID,
+			Body:      ch.Body,
+			UserID:    ch.UserID,
+			CreatedAt: ch.CreatedAt,
+			UpdatedAt: ch.UpdatedAt,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write(dat)
+	json.NewEncoder(w).Encode(chirps)
+}
+
+func (cfg *apiConfig) getChirpById(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("chirpID") // assuming you named the route param :id
+	id, err := uuid.Parse(idStr)
+	// if err != nil {
+	// 	http.Error(w, "Invalid UUID", http.StatusBadRequest)
+	// 	return
+	// }
+
+	dbChirp, err := cfg.dbQueries.GetChirpByID(r.Context(), id)
+	if err != nil {
+		http.Error(w, "Chirp not found", http.StatusNotFound)
+		return
+	}
+
+	chirp := Chirp{
+		ID:        dbChirp.ID,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(chirp)
 }
 
 func respondWithError(w http.ResponseWriter, code int, msg string)         {}
@@ -223,8 +324,10 @@ func main() {
 
 	mux.HandleFunc("GET /admin/metrics", apiCfg.getMetricsHandler) // fixed method reference
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetMetricsHandler)
-	mux.HandleFunc("POST /api/validate_chirp", chirpHandler)
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
+	mux.HandleFunc("POST /api/chirps", apiCfg.chirpHandler)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpById)
+	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 
 	// Start the server
 	if err := server.ListenAndServe(); err != nil {
