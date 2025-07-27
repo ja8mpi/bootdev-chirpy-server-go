@@ -7,19 +7,34 @@ package database
 
 import (
 	"context"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (id, created_at, updated_at, email)
+INSERT INTO users (id, created_at, updated_at, email, hashed_password)
 
-VALUES (gen_random_uuid(), now(), now(), $1)
+VALUES (gen_random_uuid(), now(), now(), $1, $2)
 
 RETURNING id, created_at, updated_at, email
 `
 
-func (q *Queries) CreateUser(ctx context.Context, email string) (User, error) {
-	row := q.db.QueryRowContext(ctx, createUser, email)
-	var i User
+type CreateUserParams struct {
+	Email          string
+	HashedPassword string
+}
+
+type CreateUserRow struct {
+	ID        uuid.UUID
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Email     string
+}
+
+func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error) {
+	row := q.db.QueryRowContext(ctx, createUser, arg.Email, arg.HashedPassword)
+	var i CreateUserRow
 	err := row.Scan(
 		&i.ID,
 		&i.CreatedAt,

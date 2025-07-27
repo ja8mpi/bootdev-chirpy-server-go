@@ -13,15 +13,18 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/ja8mpi/bootdev-chirpy-server-go/internal/database"
+	"github.com/ja8mpi/go-auth"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
 
 type parameters struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	ExpiresInSeconds int    `json:"expires_in_seconds"`
 }
 
 type chripParams struct {
@@ -42,6 +45,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 type Chirp struct {
@@ -61,6 +65,7 @@ type apiConfig struct {
 	dbQueries      *database.Queries
 	platform       string
 	db             *sql.DB
+	jwtSign        string
 }
 
 func readinessHandler(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +111,14 @@ func (cfg *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	params := chripParams{}
 	err := decoder.Decode(&params)
+
+	token, err := auth.GetBearerToken(r.Header)
+
+	if err != nil {
+		log.Printf("Error checking Bearer parameters: %s", err)
+		w.WriteHeader(500)
+		return
+	}
 
 	if err != nil {
 		log.Printf("Error decoding parameters: %s", err)
@@ -220,7 +233,17 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	user, err := cfg.dbQueries.CreateUser(r.Context(), params.Email)
+	pwd, err := auth.HashPassword(params.Password)
+	if err != nil {
+		log.Printf("Error hashing password: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+
+	user, err := cfg.dbQueries.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          params.Email,
+		HashedPassword: pwd,
+	})
 
 	if err != nil {
 		log.Printf("%v", err)
@@ -290,11 +313,65 @@ func (cfg *apiConfig) getChirpById(w http.ResponseWriter, r *http.Request) {
 func respondWithError(w http.ResponseWriter, code int, msg string)         {}
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {}
 
+func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
+
+	decoder := json.NewDecoder(r.Body)
+	var params parameters
+	err := decoder.Decode(&params)
+
+	if err != nil {
+		log.Printf("Error decoding parameters: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if params.ExpiresInSeconds > int(time.Hour/time.Second) || params.ExpiresInSeconds == 0 {
+		params.ExpiresInSeconds = int(time.Hour / time.Second)
+	}
+
+	// Create the token
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "user123",                                                                   // subject (user id or username)
+		"exp": time.Now().Add(time.Duration(params.ExpiresInSeconds) * time.Second).Unix(), // expiration time (1 hour from now)
+		"iat": time.Now().Unix(),                                                           // issued at time
+	})
+
+	// Sign the token with the secret
+	tokenString, err := token.SignedString(cfg.jwtSign)
+
+	dbUser, err := cfg.dbQueries.GetUserByEmail(r.Context(), params.Email)
+	if err != nil {
+		log.Printf("Error getting user: %s", err)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	err = auth.CheckPasswordHash(params.Password, dbUser.HashedPassword)
+	if err != nil {
+		log.Printf("Wrong password: %s", err)
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	user := User{
+		ID:        dbUser.ID,
+		CreatedAt: dbUser.CreatedAt,
+		UpdatedAt: dbUser.UpdatedAt,
+		Email:     dbUser.Email,
+		Token:     tokenString,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(user)
+}
+
 func main() {
 	godotenv.Load()
 
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	jwtSign := os.Getenv("JWT_SIGN")
 	db, err := sql.Open("postgres", dbURL)
 
 	if err != nil {
@@ -314,6 +391,7 @@ func main() {
 		dbQueries:      dbQueries,
 		platform:       platform,
 		db:             db,
+		jwtSign:        jwtSign,
 	}
 
 	// File server at /app/
@@ -328,6 +406,7 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", apiCfg.chirpHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpById)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
+	mux.HandleFunc("POST /api/login", apiCfg.loginHandler)
 
 	// Start the server
 	if err := server.ListenAndServe(); err != nil {
