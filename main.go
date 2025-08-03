@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/ja8mpi/bootdev-chirpy-server-go/internal/database"
 	"github.com/ja8mpi/go-auth"
@@ -90,12 +88,19 @@ func (cfg *apiConfig) getMetricsHandler(w http.ResponseWriter, r *http.Request) 
 func (cfg *apiConfig) resetMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	if cfg.platform != "dev" {
 		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte("forbidden"))
+		return
 	}
+
 	err := cfg.dbQueries.DeleteAllUsers(r.Context())
 	if err != nil {
-		log.Fatalf("failed to delete all users: %v", err)
+		fmt.Printf("failed to delete all users: %v\n", err)
+		http.Error(w, "failed to delete users", http.StatusInternalServerError)
+		return
 	}
+
 	cfg.fileserverHits.Store(0)
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
@@ -108,77 +113,70 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 }
 
 func (cfg *apiConfig) chirpHandler(w http.ResponseWriter, r *http.Request) {
+
+	// Decode JSON params
 	decoder := json.NewDecoder(r.Body)
 	params := chripParams{}
-	err := decoder.Decode(&params)
-
+	if err := decoder.Decode(&params); err != nil {
+		fmt.Printf("Error decoding parameters: %s\n", err)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+	fmt.Printf("Decoded params: %+v\n", params)
+	// Get bearer token from headers
 	token, err := auth.GetBearerToken(r.Header)
-
 	if err != nil {
-		log.Printf("Error checking Bearer parameters: %s", err)
-		w.WriteHeader(500)
+		fmt.Printf("Error checking Bearer parameters: %s\n", err)
+		http.Error(w, "Missing or invalid authorization header", http.StatusUnauthorized)
 		return
 	}
 
+	// Validate JWT token
+	userid, err := auth.ValidateJWT(token, cfg.jwtSign)
 	if err != nil {
-		log.Printf("Error decoding parameters: %s", err)
-		w.WriteHeader(500)
+		fmt.Printf("Invalid token: %s\n", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Check if user exists
-	_, err = cfg.dbQueries.GetUserByID(r.Context(), params.UserId)
-	if err != nil {
-		// handle user not found error or DB error
+	if _, err := cfg.dbQueries.GetUserByID(r.Context(), userid); err != nil {
+		// You may want to check for specific "not found" error if your DB driver supports it
 		http.Error(w, "User not found", http.StatusBadRequest)
 		return
 	}
 
+	// Check chirp length
 	if len(params.Body) > 140 {
-
-		respBody := errorReturnVals{
-			Error: "Chirp is too long",
-		}
-		dat, err := json.Marshal(respBody)
-		if err != nil {
-			log.Printf("Error marshalling JSON: %s", err)
-			w.WriteHeader(500)
-			return
-		}
+		respBody := errorReturnVals{Error: "Chirp is too long"}
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(400)
-		w.Write(dat)
+		w.WriteHeader(http.StatusBadRequest)
+		if err := json.NewEncoder(w).Encode(respBody); err != nil {
+			fmt.Printf("Error marshalling JSON: %s\n", err)
+		}
 		return
 	}
 
-	//check if params contain forbidden words
+	// Process forbidden words
 	processedWords, _ := processWords(params.Body)
+	cleanedBody := processedWords
 
-	cleanedBody := cleanedReturnVals{
-		CleanedBody: processedWords,
-	}
-	// dat, err := json.Marshal(cleanedBody)
-	// if err != nil {
-	// 	log.Printf("Error marshalling JSON: %s", err)
-	// 	w.WriteHeader(500)
-	// 	return
-	// }
+	// Create chirp in DB
 	dbChirp, err := cfg.dbQueries.CreateChirp(r.Context(), database.CreateChirpParams{
-		Body:   cleanedBody.CleanedBody,
-		UserID: params.UserId,
+		Body:   cleanedBody,
+		UserID: userid,
 	})
-
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return // stop further execution
+		return
 	}
 
+	// Return created chirp
 	chirp := Chirp{
 		ID:        dbChirp.ID,
 		Body:      dbChirp.Body,
-		UserID:    dbChirp.UserID,
+		UserID:    userid,
 		CreatedAt: dbChirp.CreatedAt,
 		UpdatedAt: dbChirp.UpdatedAt,
 	}
@@ -228,14 +226,14 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 	err := decoder.Decode(&params)
 
 	if err != nil {
-		log.Printf("Error decoding parameters: %s", err)
+		fmt.Printf("Error decoding parameters: %s\n", err)
 		w.WriteHeader(500)
 		return
 	}
 
 	pwd, err := auth.HashPassword(params.Password)
 	if err != nil {
-		log.Printf("Error hashing password: %s", err)
+		fmt.Printf("Error hashing password: %s\n", err)
 		w.WriteHeader(500)
 		return
 	}
@@ -246,7 +244,7 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 	})
 
 	if err != nil {
-		log.Printf("%v", err)
+		fmt.Printf("%v\n", err)
 		w.WriteHeader(500)
 	}
 
@@ -285,12 +283,12 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) getChirpById(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("chirpID") // assuming you named the route param :id
+	idStr := r.PathValue("chirpID")
 	id, err := uuid.Parse(idStr)
-	// if err != nil {
-	// 	http.Error(w, "Invalid UUID", http.StatusBadRequest)
-	// 	return
-	// }
+	if err != nil {
+		http.Error(w, "Invalid UUID", http.StatusBadRequest)
+		return
+	}
 
 	dbChirp, err := cfg.dbQueries.GetChirpByID(r.Context(), id)
 	if err != nil {
@@ -320,36 +318,37 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 	err := decoder.Decode(&params)
 
 	if err != nil {
-		log.Printf("Error decoding parameters: %s", err)
+		fmt.Printf("Error decoding parameters: %s\n", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	if params.ExpiresInSeconds > int(time.Hour/time.Second) || params.ExpiresInSeconds == 0 {
-		params.ExpiresInSeconds = int(time.Hour / time.Second)
-	}
-
-	// Create the token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub": "user123",                                                                   // subject (user id or username)
-		"exp": time.Now().Add(time.Duration(params.ExpiresInSeconds) * time.Second).Unix(), // expiration time (1 hour from now)
-		"iat": time.Now().Unix(),                                                           // issued at time
-	})
-
-	// Sign the token with the secret
-	tokenString, err := token.SignedString(cfg.jwtSign)
-
 	dbUser, err := cfg.dbQueries.GetUserByEmail(r.Context(), params.Email)
 	if err != nil {
-		log.Printf("Error getting user: %s", err)
+		fmt.Printf("Error getting user: %s\n", err)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	err = auth.CheckPasswordHash(params.Password, dbUser.HashedPassword)
 	if err != nil {
-		log.Printf("Wrong password: %s", err)
+		fmt.Printf("Wrong password: %s\n", err)
 		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	const maxExpirationSeconds = int(time.Hour / time.Second) // 3600
+
+	if params.ExpiresInSeconds <= 0 || params.ExpiresInSeconds > maxExpirationSeconds {
+		params.ExpiresInSeconds = maxExpirationSeconds
+	}
+
+	// Create the token
+	token, err := auth.MakeJWT(dbUser.ID, cfg.jwtSign, time.Duration(params.ExpiresInSeconds)*time.Second)
+
+	if err != nil {
+		fmt.Printf("Error creating token %s\n", err)
+		http.Error(w, `{"error":"Invalid email or password"}`, http.StatusUnauthorized)
 		return
 	}
 
@@ -358,12 +357,14 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: dbUser.CreatedAt,
 		UpdatedAt: dbUser.UpdatedAt,
 		Email:     dbUser.Email,
-		Token:     tokenString,
+		Token:     token,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(user)
+
+	if err := json.NewEncoder(w).Encode(user); err != nil {
+		fmt.Printf("Failed to write response: %s\n", err)
+	}
 }
 
 func main() {
